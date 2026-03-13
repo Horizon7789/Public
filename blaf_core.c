@@ -1,167 +1,136 @@
-/*                                                       * ╔══════════════════════════════════════════════════════════════╗
- * ║         BLAF — Bit-Level AI Flow                            ║                                               * ║         Version 0.2 — Full Sentence & Reasoning Engine      ║                                               * ║                                                              ║
- * ║  This is the core engine — no main().                       ║                                               * ║  Compile: see main.c                                        ║                                               * ╚══════════════════════════════════════════════════════════════╝                                              *                                                       *  Architecture:                                        *  ┌─────────────────────────────────────────────────────────┐                                                  *  │  INPUT → Tokenizer → Prism Filter → Sentence Buffer     │                                                  *  │        → Chain Validator → Reasoning Window             │
- *  │        → Response Builder → OUTPUT                      │
- *  └─────────────────────────────────────────────────────────┘
+/*
+ * ╔══════════════════════════════════════════════════════════════╗
+ * ║  BLAF — blaf_core.c  v0.6                                   ║
+ * ║  Core Engine — Tokenizer, Sentence Builder, Reasoning       ║
+ * ║  No main(). Compile with main.c.                            ║
+ * ╚══════════════════════════════════════════════════════════════╝
+ *
+ *  Architecture:
+ *  ┌──────────────────────────────────────────────────────────┐
+ *  │  INPUT → Tokenizer → Prism Filter → Sentence Buffer      │
+ *  │        → Curiosity Engine (unknown word resolver)         │
+ *  │        → Chain Validator → Reasoning Window              │
+ *  │        → blaf_learn (POS tag + SVO facts)                │
+ *  │        → Response Builder → OUTPUT                       │
+ *  └──────────────────────────────────────────────────────────┘
  */
+
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
 
-#include "blaf_syntax.h"
+#include "blaf_core.h"
 #include "blaf_grammar.h"
-#include "blaf_advanced.h"
-#include "blaf_advanced.h"
 #include "blaf_sectors.h"
 #include "blaf_advanced.h"
 #include "blaf_llm.h"
-#include "blaf_core.h"
+#include "blaf_syntax.h"
+#include "blaf_learn.h"     /* learn_sentence(), learn_paragraph() */
 
-/* Curiosity resolver — defined below in this file */
+/* Curiosity resolver — defined later in this file */
 static void resolve_unknown_word(const char *word);
 
 /* ═══════════════════════════════════════════════════════════════
-   SECTION III: GLOBAL STATE
+   GLOBAL STATE
    ═══════════════════════════════════════════════════════════════ */
 
 ConceptEntry    concept_table[MAX_CONCEPTS];
 int             concept_count = 0;
 
-/* NEW: The Fact Pool */
 Fact            fact_pool[MAX_FACT_POOL];
 int             fact_count = 0;
 
-
-ContextRegister ctx           = {0, SECTOR_GENERAL, 0, 0};
-ReasoningWindow reasoning     = {{{{{0}},0,0}},0};
-SentenceBuffer  sentence      = {0};
+ContextRegister ctx       = {0, SECTOR_GENERAL, 0, 0};
+ReasoningWindow reasoning = {{{{{0}},0,0}},0};
+SentenceBuffer  sentence  = {0};
 
 /* ═══════════════════════════════════════════════════════════════
-   SECTION IV: HASHING & CONCEPT TABLE
+   HASHING
    ═══════════════════════════════════════════════════════════════ */
 
-// Simple hash function for words
 uint32_t hash_word(const char *str) {
     uint32_t hash = 5381;
     int c;
-    while ((c = *str++)) hash = ((hash << 5) + hash) + c; 
+    while ((c = *str++)) hash = ((hash << 5) + hash) + c;
     return hash;
 }
 
 const char* get_word_from_hash(uint32_t hash) {
-    for (int i = 0; i < concept_count; i++) {
-        if (hash_word(concept_table[i].word) == hash) {
+    for (int i = 0; i < concept_count; i++)
+        if (hash_word(concept_table[i].word) == hash)
             return concept_table[i].word;
-        }
-    }
     return NULL;
 }
 
+/* ═══════════════════════════════════════════════════════════════
+   FACT POOL
+   ═══════════════════════════════════════════════════════════════ */
 
 void store_fact_in_pool(uint32_t s_hash, uint32_t v_hash, uint32_t o_hash) {
-    // 1. Map the 32-bit Verb hash to your 8-bit predicate ID
-    // You likely have a function or a simple cast for this
-    uint8_t pred_id = (uint8_t)(v_hash % 255); 
+    uint8_t pred_id = (uint8_t)(v_hash % 255);
 
-    // 2. Check for existing facts to avoid duplicates
+    /* Deduplicate */
     for (int i = 0; i < fact_count; i++) {
-        if (fact_pool[i].subject_hash == s_hash && 
-            fact_pool[i].predicate == pred_id && 
-            fact_pool[i].object_hash == o_hash) {
-            
+        if (fact_pool[i].subject_hash == s_hash &&
+            fact_pool[i].predicate    == pred_id &&
+            fact_pool[i].object_hash  == o_hash) {
             if (fact_pool[i].weight < 255) fact_pool[i].weight++;
             return;
         }
     }
 
-    // 3. Store new fact
     if (fact_count < MAX_FACT_POOL) {
         fact_pool[fact_count].subject_hash = s_hash;
         fact_pool[fact_count].predicate    = pred_id;
         fact_pool[fact_count].object_hash  = o_hash;
         fact_pool[fact_count].weight       = 1;
         fact_count++;
-        
-        // Debug print to verify it's working in your terminal
-        printf("[POOL] Fact Linked: [S:%u] --(P:%u)--> [O:%u]\n", s_hash, pred_id, o_hash);
     } else {
-        printf("[POOL] Error: Fact pool is full!\n");
+        printf("[POOL] Fact pool full!\n");
     }
 }
 
-
-
-
-void extract_facts_from_text(const char *text, const char *primary_subject) {
-    char *buffer = strdup(text);
-    char *sentence = strtok(buffer, ".");
-    
-    // Predicate mapping (Matches your uint8_t predicate field)
-    // 0: is, 1: contains, 2: orbits, 3: uses, 4: has
-    const char *verbs[] = {"is", "contains", "orbits", "uses", "has"};
-    uint32_t s_hash = hash_word(primary_subject);
-
-    while (sentence != NULL && fact_count < MAX_FACT_POOL) {
-        for (uint8_t i = 0; i < 5; i++) {
-            char *verb_pos = strstr(sentence, verbs[i]);
-            if (verb_pos) {
-                char object_name[64];
-                if (sscanf(verb_pos + strlen(verbs[i]), "%s", object_name) == 1) {
-                    
-                    // Clean and learn the object
-                    uint32_t o_hash = hash_word(object_name);
-                    if (find_concept_index(object_name, 0x00) == -1) {
-                        add_concept(object_name, 0, 0, 1, 0x00, 0xFF, 0xFF);
-                    }
-
-                    // Store Fact as a compact triple
-                    fact_pool[fact_count].subject_hash = s_hash;
-                    fact_pool[fact_count].predicate    = i; 
-                    fact_pool[fact_count].object_hash  = o_hash;
-                    
-                    fact_count++;
-                    printf("[FACT] Saved: %08X --(%d)--> %08X\n", s_hash, i, o_hash);
-                }
-            }
-        }
-        sentence = strtok(NULL, ".");
-    }
-    free(buffer);
+uint8_t map_verb_to_id(const char *verb) {
+    if (strcmp(verb, "is")       == 0) return 0;
+    if (strcmp(verb, "has")      == 0) return 1;
+    if (strcmp(verb, "contains") == 0) return 2;
+    if (strcmp(verb, "uses")     == 0) return 3;
+    if (strcmp(verb, "calls")    == 0) return 4;
+    return 0xFF;
 }
 
+/* ═══════════════════════════════════════════════════════════════
+   CONCEPT TABLE
+   ═══════════════════════════════════════════════════════════════ */
 
 static int get_next_free_slot(void) {
     for (int i = 0; i < MAX_CONCEPTS; i++) {
-        // If the word is empty, the slot is free
         if (concept_table[i].word[0] == '\0') {
-            // CRITICAL: Initialize pointer to NULL to prevent crashes
-            concept_table[i].summary = NULL;
+            concept_table[i].summary     = NULL;
             concept_table[i].summary_len = 0;
             return i;
         }
     }
-    return -1; // Table full
+    return -1;
 }
-
 
 int add_concept(const char *word, uint8_t type, uint8_t class,
                 uint8_t integrity, uint8_t sector,
                 uint8_t in_pin, uint8_t out_pin) {
     if (concept_count >= MAX_CONCEPTS) return -1;
 
-    int existing_idx = find_concept_index(word, 0xFF);
-    if (existing_idx != -1) {
-        return existing_idx; // Return the one we already have
-    }
+    int existing = find_concept_index(word, 0xFF);
+    if (existing != -1) return existing;
 
     int idx = get_next_free_slot();
-    concept_table[idx].summary = NULL;     // VERY IMPORTANT
+    if (idx < 0) return -1;
+
+    concept_table[idx].summary     = NULL;
     concept_table[idx].summary_len = 0;
 
     ConceptEntry *e = &concept_table[concept_count++];
-
     strncpy(e->word, word, MAX_WORD_LEN - 1);
     e->block.type_tag   = type;
     e->block.class_tag  = class;
@@ -170,158 +139,35 @@ int add_concept(const char *word, uint8_t type, uint8_t class,
     e->block.input_pin  = in_pin;
     e->block.output_pin = out_pin;
     e->block.payload    = hash_word(word);
+    e->sector           = sector;
+    e->trust            = integrity;
     return 0;
 }
 
-uint8_t map_verb_to_id(const char *verb) {
-    if (strcmp(verb, "is") == 0) return 0;
-    if (strcmp(verb, "has") == 0) return 1;
-    if (strcmp(verb, "contains") == 0) return 2;
-    if (strcmp(verb, "uses") == 0) return 3;
-    if (strcmp(verb, "calls") == 0) return 4;
-    return 0xFF;
-}
-
-const char* find_sentence_subject(Token *tokens, int t_count) {
-    for (int i = 0; i < t_count; i++) {
-        // Look for the first Noun, Proper Noun, or Pronoun
-        if (tokens[i].class == CLASS_NOUN || tokens[i].class == CLASS_PRONOUN) {
-            // Optional: Skip common generic pronouns like "it" if you want 
-            // more specific facts, but usually, the first noun is your winner.
-            return tokens[i].word;
-        }
-    }
-    return tokens[0].word; // Fallback to first word if no noun found
-}
-
-
-void learn_from_sentence(const char *sentence) {
-    Token tokens[64];
-    int t_count = 0;
-    
-    // --- STAGE 1: TRY ONLINE (HIGH TRUST) ---
-    if (check_internet_connection()) {
-        t_count = tokenize_with_online_teacher(sentence, tokens);
-        // If successful, these tokens have TRUST_VERIFIED
-    } 
-
-    // --- STAGE 2: FALLBACK TO LOCAL (LOW TRUST) ---
-    if (t_count == 0) {
-        t_count = tokenize_and_tag_local(sentence, tokens);
-        // These tokens have TRUST_INFERRED
-    }
-    
-    if (t_count > 0) {
-        // NEW: Dynamically find the subject instead of assuming tokens[0]
-        const char *subject = find_sentence_subject(tokens, t_count);
-
-        for (int i = 0; i < t_count; i++) {
-            if (tokens[i].trust == TRUST_VERIFIED) {
-                sync_concept_pos_with_web(tokens[i].word, tokens[i].class);
-            }
-            update_word_pos_weight(tokens[i].word, tokens[i].class);
-        }
-
-        syntax_record_sentence(sentence);
-        
-        // Pass the identified subject to the fact extractor
-        learn_complex_fact_internal(tokens, t_count, subject);
-    }
-
-}
-
-
-void learn_complex_fact_internal(Token *tokens, int t_count, const char *subject) {
-    int subj_pos = -1;
-    for (int i = 0; i < t_count; i++) {
-        if (!strcasecmp(tokens[i].word, subject)) { subj_pos = i; break; }
-    }
-
-    if (subj_pos == -1) return;
-
-    for (int i = subj_pos + 1; i < t_count; i++) {
-        
-        // --- PATTERN 1: ACTION (SUBJECT -> VERB -> OBJECT) ---
-        if (tokens[i].class == CLASS_VERB) {
-            int obj_start = i + 1;
-            while (obj_start < t_count && tokens[obj_start].class == CLASS_ARTICLE) obj_start++;
-            
-            char object[256] = {0};
-            for (int j = obj_start; j < t_count; j++) {
-                if (tokens[j].class == CLASS_PUNCTUATION) break;
-                strcat(object, tokens[j].word);
-                if (j < t_count - 1) strcat(object, " ");
-            }
-
-            if (strlen(object) > 0) {
-                store_fact_in_pool(hash_word(subject), hash_word(tokens[i].word), hash_word(object));
-                add_concept(object, TYPE_IDENTIFIER, CLASS_NOUN, TRUST_SINGLE, SECTOR_GENERAL, PIN_ANY, PIN_ANY);
-                printf("[FACT] %s [%s] %s\n", subject, tokens[i].word, object);
-            }
-            break;
-        }
-
-        // --- PATTERN 2: COPULA (SUBJECT IS OBJECT) ---
-        if (tokens[i].class == CLASS_AUX_VERB && (!strcasecmp(tokens[i].word, "is") || !strcasecmp(tokens[i].word, "was"))) {
-            int obj_start = i + 1;
-            while (obj_start < t_count && tokens[obj_start].class == CLASS_ARTICLE) obj_start++;
-
-            char object[256] = {0};
-            for (int j = obj_start; j < t_count; j++) {
-                if (tokens[j].class == CLASS_PUNCTUATION) break;
-                strcat(object, tokens[j].word);
-                if (j < t_count - 1) strcat(object, " ");
-            }
-            
-            if (strlen(object) > 0) {
-                store_fact_in_pool(hash_word(subject), hash_word("is"), hash_word(object));
-                printf("[FACT] %s [is] %s\n", subject, object);
-            }
-            break;
-        }
-        
-        // --- PATTERN 3: PASSIVE/PREPOSITIONAL (BY/ON/IN) ---
-        if (tokens[i].class == CLASS_PREP && !strcasecmp(tokens[i].word, "by")) {
-             // ... Your existing passive voice logic ...
-        }
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
 /* ═══════════════════════════════════════════════════════════════
    ACCESSOR FUNCTIONS
-   Safe field-level access — NEVER use raw byte offsets.
    ═══════════════════════════════════════════════════════════════ */
 
-int      get_concept_count  (void)  { return concept_count; }
-void*    get_concept_entry  (int i) { return (i>=0&&i<concept_count)?(void*)&concept_table[i]:NULL; }
-const char* get_concept_word(int i) { return (i>=0&&i<concept_count)?concept_table[i].word:NULL; }
-uint8_t  get_concept_class  (int i) { return (i>=0&&i<concept_count)?concept_table[i].block.class_tag :0xFF; }
-uint8_t  get_concept_sector (int i) { return (i>=0&&i<concept_count)?concept_table[i].block.sector    :0xFF; }
-uint8_t  get_concept_trust  (int i) { return (i>=0&&i<concept_count)?concept_table[i].block.integrity :0xFF; }
-uint8_t  get_concept_inpin  (int i) { return (i>=0&&i<concept_count)?concept_table[i].block.input_pin :0x00; }
-uint8_t  get_concept_outpin (int i) { return (i>=0&&i<concept_count)?concept_table[i].block.output_pin:0x00; }
-uint32_t get_concept_payload(int i) { return (i>=0&&i<concept_count)?concept_table[i].block.payload   :0x00; }
+int         get_concept_count  (void)  { return concept_count; }
+void*       get_concept_entry  (int i) { return (i>=0&&i<concept_count)?(void*)&concept_table[i]:NULL; }
+const char* get_concept_word   (int i) { return (i>=0&&i<concept_count)?concept_table[i].word:NULL; }
+uint8_t     get_concept_class  (int i) { return (i>=0&&i<concept_count)?concept_table[i].block.class_tag :0xFF; }
+uint8_t     get_concept_sector (int i) { return (i>=0&&i<concept_count)?concept_table[i].block.sector    :0xFF; }
+uint8_t     get_concept_trust  (int i) { return (i>=0&&i<concept_count)?concept_table[i].block.integrity :0xFF; }
+uint8_t     get_concept_inpin  (int i) { return (i>=0&&i<concept_count)?concept_table[i].block.input_pin :0x00; }
+uint8_t     get_concept_outpin (int i) { return (i>=0&&i<concept_count)?concept_table[i].block.output_pin:0x00; }
+uint32_t    get_concept_payload(int i) { return (i>=0&&i<concept_count)?concept_table[i].block.payload   :0x00; }
 
 int set_concept_trust(int index, uint8_t trust) {
     if (index < 0 || index >= concept_count) return -1;
     concept_table[index].block.integrity = trust;
+    concept_table[index].trust           = trust;
     return 0;
 }
 int set_concept_sector(int index, uint8_t sector) {
     if (index < 0 || index >= concept_count) return -1;
     concept_table[index].block.sector = sector;
+    concept_table[index].sector       = sector;
     return 0;
 }
 int find_concept_index(const char *word, uint8_t sector) {
@@ -333,14 +179,11 @@ int find_concept_index(const char *word, uint8_t sector) {
     return -1;
 }
 
-
-
 /* Sentence buffer accessors */
 void*       get_last_sentence    (void)  { return (void*)&sentence; }
 int         get_last_sentence_len(void)  { return sentence.length; }
 const char* get_sentence_word    (int i) { return (i>=0&&i<sentence.length)?sentence.words[i]:NULL; }
 void*       get_sentence_block   (int i) { return (i>=0&&i<sentence.length)?(void*)sentence.blocks[i]:NULL; }
-
 
 /* Prism Filter: sector-aware lookup */
 ConceptBlock* lookup(const char *word, uint8_t sector) {
@@ -357,10 +200,199 @@ ConceptBlock* lookup(const char *word, uint8_t sector) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   SECTION V: CONTEXT REGISTER
+   POS WEIGHT UPDATE
+   Called after blaf_learn tags tokens — updates frequency counters
+   so the concept table knows a word's dominant part of speech.
    ═══════════════════════════════════════════════════════════════ */
 
-void decay_context() { ctx.register_bits >>= 1; }
+void update_word_pos_weight(const char *word, int class_tag) {
+    int idx = find_concept_index(word, 0xFF);
+    if (idx == -1) return;
+    if      (class_tag == CLASS_NOUN) concept_table[idx].noun_hits++;
+    else if (class_tag == CLASS_VERB) concept_table[idx].verb_hits++;
+    else if (class_tag == CLASS_ADJ)  concept_table[idx].adj_hits++;
+
+    /* Promote primary_class when one POS dominates */
+    uint16_t best = concept_table[idx].noun_hits;
+    uint8_t  cls  = CLASS_NOUN;
+    if (concept_table[idx].verb_hits > best) { best = concept_table[idx].verb_hits; cls = CLASS_VERB; }
+    if (concept_table[idx].adj_hits  > best) {                                      cls = CLASS_ADJ;  }
+    concept_table[idx].primary_class = cls;
+}
+
+void sync_concept_pos_with_web(const char *word, int class_tag) {
+    int idx = find_concept_index(word, 0xFF);
+    if (idx != -1) {
+        concept_table[idx].primary_class = (uint8_t)class_tag;
+        concept_table[idx].trust         = 7; /* TRUST_VERIFIED */
+        concept_table[idx].block.integrity = 7;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   INTERNET / ONLINE TEACHER STUBS
+   These stubs keep the build clean.
+   Real implementations can be added in blaf_syntax.c or a
+   new blaf_online.c when an HTTP POS API is available.
+   ═══════════════════════════════════════════════════════════════ */
+
+int check_internet_connection(void) {
+    /* blaf_learn.c handles all learning locally.
+     * Return 0 (offline) so learn_from_sentence() falls through
+     * to the local path, which now delegates to blaf_learn. */
+    return 0;
+}
+
+int tokenize_with_online_teacher(const char *sentence_text, Token *tokens) {
+    /* Not implemented — blaf_learn.c's own tagger is used instead. */
+    (void)sentence_text; (void)tokens;
+    return 0;
+}
+
+int tokenize_and_tag_local(const char *sentence_text, Token *tokens) {
+    /* Delegate to blaf_learn's tokenizer + POS tagger.
+     * We tag into a LearnToken array then convert to Token. */
+    LearnToken lt[MAX_TOKENS_PER_SENT];
+    memset(lt, 0, sizeof(lt));
+
+    /* We expose a helper from blaf_learn for this */
+    extern int learn_tokenize_and_tag(const char *text,
+                                       LearnToken *out, int max);
+    int n = learn_tokenize_and_tag(sentence_text, lt, MAX_TOKENS_PER_SENT);
+
+    for (int i = 0; i < n && i < MAX_TOKENS; i++) {
+        strncpy(tokens[i].word, lt[i].word, MAX_WORD_LEN-1);
+
+        /* Map blaf_learn POSClass → blaf_core CLASS_* */
+        switch (lt[i].pos) {
+            case POS_NOUN:
+            case POS_PROPER:   tokens[i].class = CLASS_NOUN;     break;
+            case POS_VERB:     tokens[i].class = CLASS_VERB;     break;
+            case POS_AUX_VERB: tokens[i].class = CLASS_AUX_VERB; break;
+            case POS_ADJ:      tokens[i].class = CLASS_ADJ;      break;
+            case POS_ADV:      tokens[i].class = CLASS_ADV;      break;
+            case POS_ARTICLE:  tokens[i].class = CLASS_ARTICLE;  break;
+            case POS_PREP:     tokens[i].class = CLASS_PREP;     break;
+            case POS_CONJ:     tokens[i].class = CLASS_CONJ;     break;
+            case POS_PRONOUN:  tokens[i].class = CLASS_PRONOUN;  break;
+            case POS_PUNCT:    tokens[i].class = CLASS_PUNCTUATION; break;
+            default:           tokens[i].class = CLASS_NOUN;     break;
+        }
+        tokens[i].trust = lt[i].trust;
+    }
+    return n;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   LEARN FROM SENTENCE
+   Replaces the old stub. Now delegates to blaf_learn's full
+   POS tagger + SVO extractor and updates concept POS weights.
+   ═══════════════════════════════════════════════════════════════ */
+
+const char* find_sentence_subject(Token *tokens, int t_count) {
+    for (int i = 0; i < t_count; i++)
+        if (tokens[i].class == CLASS_NOUN ||
+            tokens[i].class == CLASS_PRONOUN)
+            return tokens[i].word;
+    return (t_count > 0) ? tokens[0].word : "";
+}
+
+void learn_from_sentence(const char *sentence_text) {
+    if (!sentence_text || !sentence_text[0]) return;
+
+    /* Use blaf_learn's proper POS tagger + SVO extractor */
+    LearnResult lr = learn_sentence(sentence_text, ctx.active_sector);
+
+    /* Update POS frequency weights in concept table for each tagged word */
+    LearnToken lt[MAX_TOKENS_PER_SENT];
+    memset(lt, 0, sizeof(lt));
+    extern int learn_tokenize_and_tag(const char *text,
+                                       LearnToken *out, int max);
+    int n = learn_tokenize_and_tag(sentence_text, lt, MAX_TOKENS_PER_SENT);
+    for (int i = 0; i < n; i++) {
+        int cls = CLASS_NOUN;
+        switch (lt[i].pos) {
+            case POS_VERB:     cls = CLASS_VERB; break;
+            case POS_ADJ:      cls = CLASS_ADJ;  break;
+            default:           cls = CLASS_NOUN; break;
+        }
+        update_word_pos_weight(lt[i].word, cls);
+    }
+
+    /* Also record in the hash-based fact pool for brain command compat */
+    for (int i = 0; i < lr.fact_count; i++) {
+        store_fact_in_pool(
+            hash_word(lr.facts[i].subject),
+            hash_word(lr.facts[i].predicate),
+            hash_word(lr.facts[i].object)
+        );
+    }
+
+    /* Record sentence structure in blaf_syntax */
+    syntax_record_sentence(sentence_text);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   EXTRACT FACTS FROM TEXT
+   Replaces the old 5-verb stub.
+   Now uses blaf_learn's paragraph learner for full SVO extraction.
+   ═══════════════════════════════════════════════════════════════ */
+
+void extract_facts_from_text(const char *text, const char *primary_subject) {
+    if (!text || !primary_subject) return;
+
+    /* blaf_learn handles sentence splitting, POS tagging, and full
+     * SVO/copula/prepositional fact extraction internally */
+    int facts_extracted = learn_paragraph(text, ctx.active_sector);
+
+    /* Also push into hash-based pool for brain command backward compat */
+    FactTriple triples[32];
+    int n = learn_query_facts(primary_subject, triples, 32);
+    for (int i = 0; i < n; i++) {
+        store_fact_in_pool(
+            hash_word(triples[i].subject),
+            hash_word(triples[i].predicate),
+            hash_word(triples[i].object)
+        );
+    }
+
+    /* Update saliency of the primary subject */
+    int idx = find_concept_index(primary_subject, 0xFF);
+    if (idx != -1)
+        concept_table[idx].saliency += (uint16_t)(facts_extracted * 5);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   LEARN COMPLEX FACT INTERNAL
+   Kept for backward compatibility with blaf_core.h declaration.
+   Delegates entirely to blaf_learn.
+   ═══════════════════════════════════════════════════════════════ */
+
+void learn_complex_fact_internal(Token *tokens, int t_count,
+                                  const char *subject) {
+    /* Reconstruct sentence from tokens and delegate */
+    char sentence_text[512] = {0};
+    for (int i = 0; i < t_count; i++) {
+        if (i > 0) strncat(sentence_text, " ", sizeof(sentence_text)-strlen(sentence_text)-1);
+        strncat(sentence_text, tokens[i].word, sizeof(sentence_text)-strlen(sentence_text)-1);
+    }
+    LearnResult lr = learn_sentence(sentence_text, ctx.active_sector);
+    (void)subject; /* blaf_learn finds subject internally */
+
+    for (int i = 0; i < lr.fact_count; i++) {
+        store_fact_in_pool(
+            hash_word(lr.facts[i].subject),
+            hash_word(lr.facts[i].predicate),
+            hash_word(lr.facts[i].object)
+        );
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   CONTEXT REGISTER
+   ═══════════════════════════════════════════════════════════════ */
+
+void decay_context(void)  { ctx.register_bits >>= 1; }
 
 void update_context(ConceptBlock *b) {
     if (b->sector != SECTOR_GENERAL) ctx.active_sector = b->sector;
@@ -368,15 +400,15 @@ void update_context(ConceptBlock *b) {
     decay_context();
 }
 
-void reset_context() {
+void reset_context(void) {
     ctx.register_bits = 0;
     ctx.active_sector = SECTOR_GENERAL;
     ctx.superposition = 0;
-    ctx.depth = 0;
+    ctx.depth         = 0;
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   SECTION VI: TOKENIZER
+   TOKENIZER
    ═══════════════════════════════════════════════════════════════ */
 
 void tokenize(const char *input, TokenList *tl) {
@@ -391,67 +423,16 @@ void tokenize(const char *input, TokenList *tl) {
     }
 }
 
-void update_word_pos_weight(const char *word, int class_tag) {
-    int idx = find_concept_index(word, 0);
-    if (idx == -1) return;
-
-    if (class_tag == CLASS_NOUN) concept_table[idx].noun_hits++;
-    else if (class_tag == CLASS_VERB) concept_table[idx].verb_hits++;
-    else if (class_tag == CLASS_ADJ)  concept_table[idx].adj_hits++;
-}
-
-void sync_concept_pos_with_web(const char *word, int class_tag) {
-    int idx = find_concept_index(word, 0);
-    if (idx != -1) {
-        concept_table[idx].primary_class = (uint8_t)class_tag; 
-        concept_table[idx].trust = 7; // TRUST_VERIFIED
-    }
-}
-
-
-
 /* ═══════════════════════════════════════════════════════════════
-   SECTION VII: SENTENCE BUFFER & CHAIN VALIDATOR
+   SENTENCE BUFFER & CHAIN VALIDATOR
    ═══════════════════════════════════════════════════════════════ */
 
 void clear_sentence(SentenceBuffer *sb) {
     memset(sb, 0, sizeof(SentenceBuffer));
     sb->break_at = -1;
 }
-/*
-void extract_facts_from_text(const char *text, const char *primary_subject) {
-    char *buffer = strdup(text);
-    char *sentence = strtok(buffer, "."); // Break text into sentences
-    
-    while (sentence != NULL) {
-        // Simple heuristic: Look for common "linking" verbs
-        const char *verbs[] = {"is", "contains", "orbits", "uses", "detects", "attacks"};
-        
-        for (int i = 0; i < 6; i++) {
-            char *verb_pos = strstr(sentence, verbs[i]);
-            if (verb_pos) {
-                // We found a potential relationship!
-                // Example: "Asteroids orbit the Sun" 
-                // Subject: Asteroids | Verb: orbit | Object: Sun
-                
-                // For now, let's log the discovery. 
-                // In your next version, we will push these to the 'fact_pool'.
-                printf("[FACT] Identified relationship: %s -> [%s]\n", primary_subject, verbs[i]);
-                
-                // Update saliency of the subject because it has confirmed facts
-                int idx = find_concept_index(primary_subject, 0x00);
-                if (idx != -1) concept_table[idx].saliency += 5;
-            }
-        }
-        sentence = strtok(NULL, ".");
-    }
-    free(buffer);
-}
 
-*/
-
-
-/* Grammar-backed blocks — one per POS class, reused for all grammar words */
+/* Grammar-backed blocks — one per POS class, reused for grammar words */
 static ConceptBlock gram_blocks[16];
 
 int build_sentence(TokenList *tl, SentenceBuffer *sb) {
@@ -459,14 +440,15 @@ int build_sentence(TokenList *tl, SentenceBuffer *sb) {
     int mapped = 0;
     for (int i = 0; i < tl->count && i < MAX_SENTENCE_LEN; i++) {
         strncpy(sb->words[i], tl->tokens[i], MAX_WORD_LEN - 1);
-        /* 1. Try full concept table (sector-aware prism filter) */
+
+        /* 1. Full concept table — sector-aware prism filter */
         ConceptBlock *b = lookup(tl->tokens[i], ctx.active_sector);
         if (b) {
             sb->blocks[i] = b;
             update_context(b);
             mapped++;
         } else {
-            /* 2. Grammar fast-lookup: pronouns/articles/aux-verbs/preps/conj
+            /* 2. Grammar fast-lookup — articles, pronouns, aux-verbs etc.
              *    are always known — never mark them UNMAPPED */
             const POSEntry *pe = get_pos_entry(tl->tokens[i]);
             if (pe) {
@@ -482,7 +464,7 @@ int build_sentence(TokenList *tl, SentenceBuffer *sb) {
                 update_context(&gram_blocks[slot]);
                 mapped++;
             } else {
-                sb->blocks[i] = NULL; /* truly unknown word */
+                sb->blocks[i] = NULL; /* truly unknown */
             }
         }
         sb->length++;
@@ -490,12 +472,10 @@ int build_sentence(TokenList *tl, SentenceBuffer *sb) {
     return mapped;
 }
 
-/* Gate check: can two consecutive blocks connect? */
 int can_connect(ConceptBlock *a, ConceptBlock *b) {
     return (a->output_pin & b->input_pin) != PIN_NONE;
 }
 
-/* Walk entire chain — set valid/break_at */
 void validate_chain(SentenceBuffer *sb) {
     sb->valid    = 1;
     sb->break_at = -1;
@@ -512,7 +492,7 @@ void validate_chain(SentenceBuffer *sb) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   SECTION VIII: REASONING WINDOW (16 × 256-bit)
+   REASONING WINDOW (16 × 256-bit)
    ═══════════════════════════════════════════════════════════════ */
 
 void clear_reasoning(ReasoningWindow *rw) {
@@ -549,9 +529,9 @@ ReasoningSummary reason(ReasoningWindow *rw) {
             sector_counts[slot->parts[p].sector]++;
             class_counts[slot->parts[p].class_tag & 0x0F]++;
             if (slot->parts[p].class_tag == CLASS_VERB ||
-                slot->parts[p].class_tag == CLASS_AUX_VERB)  rs.has_verb = 1;
+                slot->parts[p].class_tag == CLASS_AUX_VERB) rs.has_verb = 1;
             if (slot->parts[p].class_tag == CLASS_NOUN ||
-                slot->parts[p].class_tag == CLASS_PRONOUN)   rs.has_noun = 1;
+                slot->parts[p].class_tag == CLASS_PRONOUN) rs.has_noun = 1;
         }
     }
     int max_s = 0;
@@ -565,7 +545,7 @@ ReasoningSummary reason(ReasoningWindow *rw) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   SECTION IX: RESPONSE BUILDER
+   RESPONSE BUILDER
    ═══════════════════════════════════════════════════════════════ */
 
 ResponseFrame build_response(ReasoningSummary *rs, SentenceBuffer *input_sb) {
@@ -604,28 +584,13 @@ ResponseFrame build_response(ReasoningSummary *rs, SentenceBuffer *input_sb) {
                 input_sb->blocks[i]->integrity);
         p += n; rem -= n;
     }
-
-    /*
-     * FUTURE — response generation phases (commented, ready to activate):
-     * [ ] response_template_engine() — fill slots with mapped words
-     * [ ] tone_register_bits()       — formal / casual / technical tone
-     * [ ] multi_sentence_chain()     — paragraph-level output
-     * [ ] bit_trace_export()         — audit log for smart contracts
-     */
-
     return rf;
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   SECTION X: FULL PROCESSING PIPELINE
-   INPUT → TOKENIZE → BUILD → VALIDATE → REASON → RESPOND
-   ═══════════════════════════════════════════════════════════════ */
-
-/* ═══════════════════════════════════════════════════════════════
    CURIOSITY ENGINE
-   Called for every unmapped word during sentence building.
-   Tries: (1) web_lookup  (2) LLM classify  (3) mark as SANDBOX
-   All results are cached — never fetches the same word twice.
+   Resolves unknown words via web → LLM → SANDBOX fallback.
+   Never fetches the same word twice per session.
    ═══════════════════════════════════════════════════════════════ */
 
 #define WORD_CACHE_MAX 512
@@ -645,19 +610,17 @@ static void mark_word_resolved(const char *word) {
 
 static void resolve_unknown_word(const char *word) {
     if (!word || !word[0]) return;
-    /* Skip single-character tokens and punctuation */
-    if (strlen(word) <= 1) return;
-    /* Skip grammar table words — articles, pronouns, aux verbs,
-     * prepositions, conjunctions, question words are always known */
+    if (strlen(word) <= 1)  return;
+    /* Skip grammar table words — always known */
     if (get_pos_entry(word))    return;
     if (is_question_word(word)) return;
-    /* Skip if already attempted */
+    /* Skip if already attempted this session */
     if (word_was_resolved(word)) return;
 
     mark_word_resolved(word);
-    printf("║  [CURIOUS] Unknown word: \"%s\" — resolving...\n", word);
+    printf("║  [CURIOUS] Unknown: \"%s\" — resolving...\n", word);
 
-    /* Step 1: Try web lookup (Wikipedia) */
+    /* Step 1: Web lookup */
     int found = web_lookup(word);
     if (found) {
         printf("║  [CURIOUS] \"%s\" mapped via web.\n", word);
@@ -665,18 +628,22 @@ static void resolve_unknown_word(const char *word) {
         return;
     }
 
-    /* Step 2: Try LLM classification if configured */
+    /* Step 2: LLM classification */
     if (llm_map_concept(word) == 0) {
         printf("║  [CURIOUS] \"%s\" classified by LLM.\n", word);
         return;
     }
 
-    /* Step 3: Register as SANDBOX noun — at least it's tracked */
+    /* Step 3: SANDBOX fallback — at least it's tracked */
     map_word_web(word, CLASS_NOUN, SECTOR_GENERAL, PIN_ANY, PIN_ANY);
-    printf("║  [CURIOUS] \"%s\" registered as SANDBOX/NOUN fallback.\n", word);
+    printf("║  [CURIOUS] \"%s\" registered as SANDBOX/NOUN.\n", word);
 }
 
-
+/* ═══════════════════════════════════════════════════════════════
+   FULL PROCESSING PIPELINE
+   INPUT → TOKENIZE → BUILD → CURIOSITY → VALIDATE
+         → LEARN (blaf_learn) → REASON → RESPOND
+   ═══════════════════════════════════════════════════════════════ */
 
 void process(const char *input) {
     printf("\n╔══ INPUT ═══════════════════════════════════════════\n");
@@ -689,32 +656,36 @@ void process(const char *input) {
 
     int mapped = build_sentence(&tl, &sentence);
 
-    /* ── CURIOSITY: resolve every unmapped word automatically ── */
+    /* Curiosity: resolve every unmapped word */
     int resolved_any = 0;
-    for (int _i = 0; _i < sentence.length; _i++) {
-        if (!sentence.blocks[_i]) {
-            resolve_unknown_word(sentence.words[_i]);
+    for (int i = 0; i < sentence.length; i++) {
+        if (!sentence.blocks[i]) {
+            resolve_unknown_word(sentence.words[i]);
             resolved_any = 1;
         }
     }
-    
     if (resolved_any)
         mapped = build_sentence(&tl, &sentence);
 
     printf("║  Mapped  : %d / %d\n", mapped, sentence.length);
 
     validate_chain(&sentence);
-    
+
     if (sentence.valid) {
         printf("║  Chain   : VALID ✓\n");
-        learn_from_sentence(input); 
+        /* Learn using blaf_learn's full POS tagger + SVO extractor.
+         * This replaces the old learn_from_sentence() stub and updates:
+         *   - fact_pool (hash-based, for brain command)
+         *   - blaf_learn fact store (structured, for facts command)
+         *   - concept table noun_hits/verb_hits/adj_hits  */
+        learn_from_sentence(input);
     } else {
         printf("║  Chain   : BROKEN at word [%d] ✗\n", sentence.break_at);
-    } // <--- THIS WAS MISSING
+    }
 
-    // Now these run regardless of whether it learned or not
     load_into_reasoning(&sentence, &reasoning);
-    printf("║  Slots   : %d / %d active\n", reasoning.active_slots, REASONING_SLOTS);
+    printf("║  Slots   : %d / %d active\n",
+           reasoning.active_slots, REASONING_SLOTS);
 
     ReasoningSummary rs = reason(&reasoning);
     printf("║  Sector  : 0x%02X  |  Class: %d  |  Verb: %d  Noun: %d\n",
@@ -726,18 +697,8 @@ void process(const char *input) {
     printf("╚════════════════════════════════════════════════════\n");
 }
 
-
 /* ═══════════════════════════════════════════════════════════════
-   SECTION XI: CONCEPT SEED DATABASE
-   ═══════════════════════════════════════════════════════════════ */
-
-/* ═══════════════════════════════════════════════════════════════
-   PERSISTENCE — save/load concept table to disk
-   File format (binary, version-tagged):
-     4 bytes  magic   "BLAF"
-     4 bytes  version 0x00000001
-     4 bytes  count
-     count x sizeof(ConceptEntry)
+   PERSISTENCE
    ═══════════════════════════════════════════════════════════════ */
 
 #define PERSIST_MAGIC   0x464C4142u
@@ -747,7 +708,7 @@ void process(const char *input) {
 int knowledge_save(const char *path) {
     const char *fpath = path ? path : PERSIST_PATH;
     FILE *f = fopen(fpath, "wb");
-    if (!f) return -1;
+    if (!f) { fprintf(stderr, "[PERSIST] Cannot write: %s\n", fpath); return -1; }
 
     uint32_t magic = PERSIST_MAGIC;
     uint32_t ver   = PERSIST_VERSION;
@@ -757,61 +718,64 @@ int knowledge_save(const char *path) {
     fwrite(&ver,   4, 1, f);
     fwrite(&c_qty, 4, 1, f);
 
+    /* Save syntax schemas */
     FILE *fp = fopen("blaf_syntax.bin", "wb");
-    fwrite(&schema_count, sizeof(int), 1, fp);
-    fwrite(grammar_library, sizeof(SentenceSchema), schema_count, fp);
-    fclose(fp);
-
-
-    for (int i = 0; i < concept_count; i++) {
-        // 1. Write the fixed-size part (the struct)
-        // Note: The pointer 'summary' is written but will be ignored on load
-        fwrite(&concept_table[i], sizeof(ConceptEntry), 1, f);
-
-        // 2. If there is a dynamic summary, write the actual data bytes
-        if (concept_table[i].summary_len > 0 && concept_table[i].summary != NULL) {
-            fwrite(concept_table[i].summary, 1, concept_table[i].summary_len, f);
-        }
+    if (fp) {
+        fwrite(&schema_count, sizeof(int), 1, fp);
+        fwrite(grammar_library, sizeof(SentenceSchema), schema_count, fp);
+        fclose(fp);
     }
 
-    // Write Fact Pool (unchanged if Fact doesn't use pointers)
+    for (int i = 0; i < concept_count; i++) {
+        /* Write fixed struct (summary pointer will be ignored on load) */
+        fwrite(&concept_table[i], sizeof(ConceptEntry), 1, f);
+        /* Write dynamic summary bytes if present */
+        if (concept_table[i].summary_len > 0 &&
+            concept_table[i].summary != NULL)
+            fwrite(concept_table[i].summary, 1,
+                   concept_table[i].summary_len, f);
+    }
+
+    /* Write fact pool */
     uint32_t f_qty = (uint32_t)fact_count;
-    fwrite(&f_qty, 4, 1, f);
+    fwrite(&f_qty,    4,           1,          f);
     fwrite(fact_pool, sizeof(Fact), fact_count, f);
 
     fclose(f);
-    printf("[CORE] Knowledge deep-saved (%d concepts)\n", concept_count);
+    printf("[PERSIST] Saved %d concepts, %d facts.\n",
+           concept_count, fact_count);
     return 0;
 }
-
 
 int knowledge_load(const char *path) {
     const char *fpath = path ? path : PERSIST_PATH;
     FILE *f = fopen(fpath, "rb");
-    if (!f) return 0;
+    if (!f) {
+        printf("[PERSIST] No saved knowledge — starting fresh.\n");
+        return 0;
+    }
 
     uint32_t magic, ver, c_qty;
-    if (fread(&magic, 4, 1, f) != 1) { fclose(f); return 0; }
-    if (fread(&ver, 4, 1, f) != 1) { fclose(f); return 0; }
+    if (fread(&magic, 4, 1, f) != 1 ||
+        fread(&ver,   4, 1, f) != 1) { fclose(f); return 0; }
 
     if (magic != PERSIST_MAGIC || ver != PERSIST_VERSION) {
-        fclose(f);
-        return -1;
+        fprintf(stderr, "[PERSIST] Version mismatch — ignoring file.\n");
+        fclose(f); return 0;
     }
 
     fread(&c_qty, 4, 1, f);
     concept_count = (int)c_qty;
 
     for (int i = 0; i < concept_count; i++) {
-        // 1. Read the struct back into the table
         fread(&concept_table[i], sizeof(ConceptEntry), 1, f);
-
-        // 2. Re-initialize the pointer! 
-        // The one we just read from disk is a "ghost address" from the last session.
+        /* Re-allocate dynamic summary */
         if (concept_table[i].summary_len > 0) {
-            concept_table[i].summary = malloc(concept_table[i].summary_len + 1);
+            concept_table[i].summary =
+                malloc(concept_table[i].summary_len + 1);
             if (concept_table[i].summary) {
-                fread(concept_table[i].summary, 1, concept_table[i].summary_len, f);
+                fread(concept_table[i].summary, 1,
+                      concept_table[i].summary_len, f);
                 concept_table[i].summary[concept_table[i].summary_len] = '\0';
             }
         } else {
@@ -819,23 +783,26 @@ int knowledge_load(const char *path) {
         }
     }
 
-    // Load Facts
+    /* Load fact pool */
     uint32_t f_qty;
-    fread(&f_qty, 4, 1, f);
-    fact_count = (int)f_qty;
-    fread(fact_pool, sizeof(Fact), fact_count, f);
+    if (fread(&f_qty, 4, 1, f) == 1) {
+        fact_count = (int)f_qty;
+        fread(fact_pool, sizeof(Fact), fact_count, f);
+    }
 
     fclose(f);
+    printf("[PERSIST] Loaded %d concepts, %d facts.\n",
+           concept_count, fact_count);
     return concept_count;
 }
 
+void knowledge_autosave(void) { knowledge_save(NULL); }
 
-void knowledge_autosave(void) {
-    knowledge_save(NULL);
-}
+/* ═══════════════════════════════════════════════════════════════
+   CONCEPT SEED DATABASE
+   ═══════════════════════════════════════════════════════════════ */
 
-
-void seed_concepts() {
+void seed_concepts(void) {
     /* ARTICLES & FUNCTION WORDS */
     add_concept("the",        TYPE_LITERAL,    CLASS_ARTICLE,  TRUST_IMMUTABLE, SECTOR_GENERAL,  PIN_ANY,                 PIN_NOUN|PIN_ADJ);
     add_concept("a",          TYPE_LITERAL,    CLASS_ARTICLE,  TRUST_IMMUTABLE, SECTOR_GENERAL,  PIN_ANY,                 PIN_NOUN|PIN_ADJ);
@@ -859,17 +826,17 @@ void seed_concepts() {
     add_concept("into",       TYPE_LITERAL,    CLASS_PREP,     TRUST_IMMUTABLE, SECTOR_GENERAL,  PIN_ANY,                 PIN_NOUN|PIN_ARTICLE);
 
     /* PRONOUNS */
-    add_concept("i",          TYPE_IDENTIFIER, CLASS_PRONOUN,  TRUST_IMMUTABLE, SECTOR_GENERAL,  PIN_ANY,                 PIN_VERB|PIN_VERB);
-    add_concept("you",        TYPE_IDENTIFIER, CLASS_PRONOUN,  TRUST_IMMUTABLE, SECTOR_GENERAL,  PIN_ANY,                 PIN_VERB|PIN_VERB);
-    add_concept("he",         TYPE_IDENTIFIER, CLASS_PRONOUN,  TRUST_IMMUTABLE, SECTOR_GENERAL,  PIN_ANY,                 PIN_VERB|PIN_VERB);
-    add_concept("she",        TYPE_IDENTIFIER, CLASS_PRONOUN,  TRUST_IMMUTABLE, SECTOR_GENERAL,  PIN_ANY,                 PIN_VERB|PIN_VERB);
-    add_concept("it",         TYPE_IDENTIFIER, CLASS_PRONOUN,  TRUST_IMMUTABLE, SECTOR_GENERAL,  PIN_ANY,                 PIN_VERB|PIN_VERB);
-    add_concept("they",       TYPE_IDENTIFIER, CLASS_PRONOUN,  TRUST_IMMUTABLE, SECTOR_GENERAL,  PIN_ANY,                 PIN_VERB|PIN_VERB);
-    add_concept("we",         TYPE_IDENTIFIER, CLASS_PRONOUN,  TRUST_IMMUTABLE, SECTOR_GENERAL,  PIN_ANY,                 PIN_VERB|PIN_VERB);
-    add_concept("this",       TYPE_IDENTIFIER, CLASS_PRONOUN,  TRUST_IMMUTABLE, SECTOR_GENERAL,  PIN_ANY,                 PIN_NOUN|PIN_VERB|PIN_VERB);
-    add_concept("that",       TYPE_IDENTIFIER, CLASS_PRONOUN,  TRUST_IMMUTABLE, SECTOR_GENERAL,  PIN_ANY,                 PIN_NOUN|PIN_VERB|PIN_VERB);
+    add_concept("i",          TYPE_IDENTIFIER, CLASS_PRONOUN,  TRUST_IMMUTABLE, SECTOR_GENERAL,  PIN_ANY, PIN_VERB);
+    add_concept("you",        TYPE_IDENTIFIER, CLASS_PRONOUN,  TRUST_IMMUTABLE, SECTOR_GENERAL,  PIN_ANY, PIN_VERB);
+    add_concept("he",         TYPE_IDENTIFIER, CLASS_PRONOUN,  TRUST_IMMUTABLE, SECTOR_GENERAL,  PIN_ANY, PIN_VERB);
+    add_concept("she",        TYPE_IDENTIFIER, CLASS_PRONOUN,  TRUST_IMMUTABLE, SECTOR_GENERAL,  PIN_ANY, PIN_VERB);
+    add_concept("it",         TYPE_IDENTIFIER, CLASS_PRONOUN,  TRUST_IMMUTABLE, SECTOR_GENERAL,  PIN_ANY, PIN_VERB);
+    add_concept("they",       TYPE_IDENTIFIER, CLASS_PRONOUN,  TRUST_IMMUTABLE, SECTOR_GENERAL,  PIN_ANY, PIN_VERB);
+    add_concept("we",         TYPE_IDENTIFIER, CLASS_PRONOUN,  TRUST_IMMUTABLE, SECTOR_GENERAL,  PIN_ANY, PIN_VERB);
+    add_concept("this",       TYPE_IDENTIFIER, CLASS_PRONOUN,  TRUST_IMMUTABLE, SECTOR_GENERAL,  PIN_ANY, PIN_NOUN|PIN_VERB);
+    add_concept("that",       TYPE_IDENTIFIER, CLASS_PRONOUN,  TRUST_IMMUTABLE, SECTOR_GENERAL,  PIN_ANY, PIN_NOUN|PIN_VERB);
 
-    /* GENERAL NOUNS — output PIN_ANY: nouns can be followed by verbs, aux verbs, preps, conjunctions */
+    /* GENERAL NOUNS */
     add_concept("system",     TYPE_IDENTIFIER, CLASS_NOUN,     TRUST_IMMUTABLE, SECTOR_GENERAL,  PIN_ARTICLE|PIN_ADJ|PIN_ANY, PIN_ANY);
     add_concept("data",       TYPE_IDENTIFIER, CLASS_NOUN,     TRUST_IMMUTABLE, SECTOR_GENERAL,  PIN_ARTICLE|PIN_ADJ|PIN_ANY, PIN_ANY);
     add_concept("code",       TYPE_IDENTIFIER, CLASS_NOUN,     TRUST_IMMUTABLE, SECTOR_GENERAL,  PIN_ARTICLE|PIN_ADJ|PIN_ANY, PIN_ANY);
@@ -891,9 +858,8 @@ void seed_concepts() {
     add_concept("key",        TYPE_IDENTIFIER, CLASS_NOUN,     TRUST_IMMUTABLE, SECTOR_SECURITY, PIN_ARTICLE|PIN_ADJ|PIN_ANY, PIN_ANY);
     add_concept("hash",       TYPE_IDENTIFIER, CLASS_NOUN,     TRUST_IMMUTABLE, SECTOR_ICT,      PIN_ARTICLE|PIN_ADJ|PIN_ANY, PIN_ANY);
 
-    /* SECURITY / ICT / FINANCE NOUNS */
+    /* SECURITY / ICT / FINANCE */
     add_concept("bug",        TYPE_IDENTIFIER, CLASS_NOUN,     TRUST_IMMUTABLE, SECTOR_SECURITY, PIN_ARTICLE|PIN_ADJ|PIN_ANY, PIN_ANY);
-    add_concept("bug",        TYPE_IDENTIFIER, CLASS_NOUN,     TRUST_IMMUTABLE, SECTOR_BIOLOGY,  PIN_ARTICLE|PIN_ADJ|PIN_ANY, PIN_ANY);
     add_concept("virus",      TYPE_IDENTIFIER, CLASS_NOUN,     TRUST_IMMUTABLE, SECTOR_SECURITY, PIN_ARTICLE|PIN_ADJ|PIN_ANY, PIN_ANY);
     add_concept("virus",      TYPE_IDENTIFIER, CLASS_NOUN,     TRUST_IMMUTABLE, SECTOR_BIOLOGY,  PIN_ARTICLE|PIN_ADJ|PIN_ANY, PIN_ANY);
     add_concept("attack",     TYPE_IDENTIFIER, CLASS_NOUN,     TRUST_IMMUTABLE, SECTOR_SECURITY, PIN_ARTICLE|PIN_ADJ|PIN_ANY, PIN_ANY);
@@ -951,9 +917,5 @@ void seed_concepts() {
     add_concept("only",       TYPE_IDENTIFIER, CLASS_ADV,      TRUST_IMMUTABLE, SECTOR_GENERAL,  PIN_ANY,                  PIN_VERB|PIN_ADJ|PIN_NOUN);
     add_concept("also",       TYPE_IDENTIFIER, CLASS_ADV,      TRUST_IMMUTABLE, SECTOR_GENERAL,  PIN_ANY,                  PIN_VERB|PIN_ADJ);
 }
-
-/* ═══════════════════════════════════════════════════════════════
-   SECTION XII: MAIN
-   ═══════════════════════════════════════════════════════════════ */
 
 /* main() lives in main.c */

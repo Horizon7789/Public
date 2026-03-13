@@ -922,6 +922,20 @@ void learn_load(const char *path) {
    INIT / NAMES
    ═══════════════════════════════════════════════════════════════ */
 
+
+/* ═══════════════════════════════════════════════════════════════
+   PUBLIC TOKENIZE + TAG
+   Called by blaf_core.c's tokenize_and_tag_local() so that the
+   core can update noun_hits/verb_hits/adj_hits per word.
+   ═══════════════════════════════════════════════════════════════ */
+int learn_tokenize_and_tag(const char *text, LearnToken *out, int max) {
+    if (!text || !out || max <= 0) return 0;
+    memset(out, 0, sizeof(LearnToken) * max);
+    int count = tokenize_sentence(text, out, max);
+    learn_tag_tokens(out, count);
+    return count;
+}
+
 void learn_init(void) {
     /* Count aux verbs for status */
     int naux=0, nprep=0, nconj=0;

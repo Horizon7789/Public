@@ -188,6 +188,7 @@ void learn_load(const char *path);
  * Human-readable POS name.
  */
 const char* pos_name(POSClass pos);
+int learn_tokenize_and_tag(const char *text, LearnToken *out, int max);
 
 /*
  * fact_type_name()

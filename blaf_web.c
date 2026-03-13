@@ -3,10 +3,12 @@
 #include "blaf_core.h"
 
 // Simple check for Termux/Android
+/*
 int check_internet_connection(void) {
     // Tries to ping Google's DNS briefly
     return system("ping -c 1 -W 1 8.8.8.8 > /dev/null 2>&1") == 0;
 }
+
 
 int tokenize_with_online_teacher(const char *sentence, Token *tokens) {
     char cmd[1024];
@@ -35,3 +37,5 @@ int tokenize_with_online_teacher(const char *sentence, Token *tokens) {
     pclose(fp);
     return count;
 }
+
+*/

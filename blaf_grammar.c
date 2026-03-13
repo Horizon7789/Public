@@ -220,6 +220,7 @@ int is_question_word(const char *word) {
 }
 
 
+/*
 int tokenize_and_tag_local(const char *sentence, Token *tokens) {
     char buf[512];
     strncpy(buf, sentence, 511);
@@ -247,6 +248,8 @@ int tokenize_and_tag_local(const char *sentence, Token *tokens) {
     }
     return count;
 }
+
+*/
 
 
 const POSEntry* get_pos_entry(const char *word) {
