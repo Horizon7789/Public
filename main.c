@@ -39,6 +39,7 @@
 #include "blaf_extractor.h"
 #include "blaf_context.h"
 #include "blaf_learn.h"
+#include "blaf_morph.h"
 
 /* From blaf_core.c */
 extern void sectors_init (void);
@@ -148,6 +149,19 @@ static void handle_query(const char *input) {
     /* ── Layer 0: Instructions ── */
     if (parse_instruction(input)) return;
 
+    /* ── Layer 0b: Morphology — normalize before anything else
+     *   "asteroids" → "asteroid"   (lemmatize)
+     *   "asteorid"  → "asteroid"   (autocorrect)
+     *   "running"   → "run"         (tense)
+     *   Preserves question words and grammar words. */
+    char morph_buf[512] = {0};
+    morph_normalize_query(input, morph_buf, sizeof(morph_buf));
+    if (morph_buf[0] && strcmp(morph_buf, input) != 0) {
+        printf("[MORPH] Normalized: \"%s\" → \"%s\"\n",
+               input, morph_buf);
+        input = morph_buf;
+    }
+
     /* ── Layer 1: Math — before speech acts
      *   "two plus two" must not trigger a greeting check */
     if (math_detect(input)) {
@@ -229,6 +243,11 @@ static void handle_query(const char *input) {
         if (local_idx != -1 && concept_table[local_idx].summary != NULL) {
             printf("[LOCAL] HIT: Using saved knowledge for \"%s\"\n", q.subject);
             web_facts = strdup(concept_table[local_idx].summary);
+            /* Learn from local knowledge on every recall —
+             * this populates fact_pool so brain command works */
+            uint8_t sec = intent_sector_hint(intent.type);
+            learn_paragraph(web_facts, sec);
+            context_add_sentence(web_facts, sec);
         }
 
         /* B. RAM cache second */
@@ -279,6 +298,8 @@ static void handle_query(const char *input) {
                 learn_paragraph(web_facts, sec);
                 map_answer_words(web_facts, sec);
                 context_add_sentence(web_facts, sec);
+                /* Register morphological variants of the subject */
+                morph_register_variants(q.subject, sec, 0);
 
                 knowledge_save(NULL);
                 learn_save(NULL);
@@ -380,6 +401,7 @@ int main(void) {
     pragmatics_init();
     extractor_init();
     context_init();
+    morph_init();
     syntax_init();
 
     /* Load all persistent knowledge before seeding
@@ -435,7 +457,8 @@ int main(void) {
         if (!strcmp(input,"tts status")) { tts_status();      continue; }
         if (!strcmp(input,"vec status")) { vec_status();      continue; }
         if (!strcmp(input,"llm status")) { llm_status();      continue; }
-        if (!strcmp(input,"ctx status")) { context_status();  continue; }
+        if (!strcmp(input,"ctx status"))   { context_status();  continue; }
+        if (!strcmp(input,"morph status")) { morph_status();    continue; }
 
         /* ── 4. Configuration ── */
         if (!strncmp(input,"load vectors ",13)) {

@@ -28,6 +28,7 @@
 #include "blaf_llm.h"
 #include "blaf_syntax.h"
 #include "blaf_learn.h"     /* learn_sentence(), learn_paragraph() */
+#include "blaf_morph.h"     /* lemmatize + autocorrect + variants */
 
 /* Curiosity resolver — defined later in this file */
 static void resolve_unknown_word(const char *word);
@@ -439,10 +440,20 @@ int build_sentence(TokenList *tl, SentenceBuffer *sb) {
     clear_sentence(sb);
     int mapped = 0;
     for (int i = 0; i < tl->count && i < MAX_SENTENCE_LEN; i++) {
-        strncpy(sb->words[i], tl->tokens[i], MAX_WORD_LEN - 1);
+        /* Normalize token via morphology before lookup
+         * "asteroids" → "asteroid", "running" → "run"
+         * so the concept table always gets the base form */
+        char norm_tok[MAX_WORD_LEN];
+        morph_lemmatize(tl->tokens[i], norm_tok, MAX_WORD_LEN);
+        /* Use normalized form for lookup but keep original for display */
+        const char *lookup_tok = norm_tok[0] ? norm_tok : tl->tokens[i];
+        strncpy(sb->words[i], tl->tokens[i], MAX_WORD_LEN - 1); /* display original */
 
         /* 1. Full concept table — sector-aware prism filter */
-        ConceptBlock *b = lookup(tl->tokens[i], ctx.active_sector);
+        ConceptBlock *b = lookup(lookup_tok, ctx.active_sector);
+        /* Fallback: try original if normalized form not found */
+        if (!b && strcmp(norm_tok, tl->tokens[i]) != 0)
+            b = lookup(tl->tokens[i], ctx.active_sector);
         if (b) {
             sb->blocks[i] = b;
             update_context(b);
@@ -450,7 +461,8 @@ int build_sentence(TokenList *tl, SentenceBuffer *sb) {
         } else {
             /* 2. Grammar fast-lookup — articles, pronouns, aux-verbs etc.
              *    are always known — never mark them UNMAPPED */
-            const POSEntry *pe = get_pos_entry(tl->tokens[i]);
+            const POSEntry *pe = get_pos_entry(lookup_tok);
+            if (!pe) pe = get_pos_entry(tl->tokens[i]);
             if (pe) {
                 int slot = pe->class_tag & 0x0F;
                 gram_blocks[slot].type_tag   = TYPE_LITERAL;
